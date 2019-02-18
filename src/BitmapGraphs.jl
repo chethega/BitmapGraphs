@@ -109,7 +109,7 @@ function BMGraph(n::Int)
 end
 
 function BMGraph(g::AbstractGraph)
-    vertices(g) == OneTo(nv(g))||throw(ArgumentError("BMGraphs only support `vertices isa Base.OneTo`"))
+    vertices(g) == Base.OneTo(nv(g))||throw(ArgumentError("BMGraphs only support `vertices isa Base.OneTo`"))
     res = BMGraph(nv(g))
     for ed in edges(g)
         add_edge!(res, src(ed), dst(ed))
