@@ -2,7 +2,7 @@ module BitmapGraphs
 
 using LightGraphs, SparseArrays
 
-export AbstractBMGraph, BMGraph, invert!, set_diag!
+export AbstractBMGraph, BMGraph, invert!, set_diag!, BitRow, SRow, nchunks, mk_msk, SBMGraph
 
 #utils for iterating over bit-chunks
 @inline _blsr(x) = x & (x-1)
@@ -17,10 +17,12 @@ end
 struct BitRow{chunk_T}
     chunks::chunk_T
 end
-const _BitRow = Union{LBitRow, BitRow}# BitRow
+struct SRow{N}
+    chunks::NTuple{N, UInt64}
+end
+const _BitRow = Union{LBitRow, BitRow, SRow}# BitRow
 
 nchunks(br::_BitRow) = length(br.chunks)
-
 
 Base.@propagate_inbounds function Base.in(br::_BitRow, idx)
     i1,i2 = Base.get_chunks_id(idx)
@@ -97,7 +99,6 @@ mutable struct BMGraph <: AbstractBMGraph
     adj_mat::BitMatrix
     degrees::Vector{Int}
     ne::Int
-    nv::Int
 end
 
 function BMGraph(n::Int)
@@ -105,7 +106,7 @@ function BMGraph(n::Int)
     adj_mat = falses(nc*64, n)
     adj_chunks = reshape(adj_mat.chunks, nc, n)
     degs = zeros(Int, n)
-    return BMGraph(adj_chunks, adj_mat, degs, 0, n)
+    return BMGraph(adj_chunks, adj_mat, degs, 0)
 end
 
 function BMGraph(g::AbstractGraph)
@@ -116,21 +117,22 @@ function BMGraph(g::AbstractGraph)
     end
     return res
 end
+nchunks(g::BMGraph) = size(g.adj_chunks, 1)
 
 function Base.copy(bm::BMGraph)
     adj_mat = copy(bm.adj_mat)
     adj_chunks = reshape(adj_mat.chunks, size(bm.adj_chunks))
-    return BMGraph(adj_chunks, adj_mat, copy(bm.degs), bm.ne, bm.nv)
+    return BMGraph(adj_chunks, adj_mat, copy(bm.degs), bm.ne)
 end
 
 
 #interface:
 LightGraphs.edgetype(::AbstractBMGraph) = LightGraphs.SimpleGraphs.SimpleEdge{Int}
-Base.eltype(::BMGraph) = Int
-LightGraphs.nv(g::BMGraph) = g.nv
+Base.eltype(::AbstractBMGraph) = Int
+LightGraphs.nv(g::AbstractBMGraph) = size(g.adj_chunks, 2)
 LightGraphs.ne(g::BMGraph) = g.ne
-LightGraphs.vertices(g::BMGraph) = Base.OneTo(g.nv)
-LightGraphs.edges(g::AbstractBMGraph) = BMEdgeIter{typeof(g.adj_chunks), LightGraphs.SimpleGraphs.SimpleEdge{Int}}(g.ne, g.adj_chunks)
+LightGraphs.vertices(g::AbstractBMGraph) = Base.OneTo(nv(g))
+LightGraphs.edges(g::AbstractBMGraph) = BMEdgeIter{typeof(g.adj_chunks), LightGraphs.SimpleGraphs.SimpleEdge{Int}}(ne(g), g.adj_chunks)
 LightGraphs.is_directed(g::AbstractBMGraph) = false
 LightGraphs.is_directed(::Type{<:AbstractBMGraph}) = false
 
@@ -144,7 +146,7 @@ Base.@propagate_inbounds function LightGraphs.outneighbors(g::BMGraph, v)
     vvv = view(g.adj_chunks, :, v)
     return LBitRow(g.degrees[v], vvv)
 end
-Base.@propagate_inbounds LightGraphs.inneighbors(g::BMGraph, v...) = outneighbors(g, v...)
+Base.@propagate_inbounds LightGraphs.inneighbors(g::AbstractBMGraph, v...) = outneighbors(g, v...)
 Base.@propagate_inbounds LightGraphs.indegree(g::BMGraph, v::Integer) = g.degrees[v]
 Base.@propagate_inbounds LightGraphs.outdegree(g::BMGraph, v) = g.degrees[v]
 #Base.@propagate_inbounds LightGraphs.degree(g::BMGraph, v) = g.degrees[v] #causes method ambiguity errors
@@ -220,11 +222,11 @@ Sets the diagonal to b, i.e. adds or removes all self-loops.
 """
 function set_diag!(bm::BMGraph, b::Bool)
     if b
-        for i=1:bm.nv
+        for i=1:nv(bm)
             add_edge!(bm, i, i)
         end
     else
-        for i=1:bm.nv
+        for i=1:nv(bm)
             rem_edge!(bm, i, i)
         end
     end
@@ -332,5 +334,119 @@ end
     #TODO: SBMGraph, where nchunks is a type parameter.
 #This permits us to return an isbits row, backed by tuple or StaticVector.
 #idea is to be super fast and allocation-free for tiny graphs with <=512 vertices.
+
+#static BMGraph. Utils
+#struct SRow{N}
+#    chunks::NTuple{N, UInt64}
+#end
+
+#Base.in, Base.iterate, are defined above
+@inline Base.length(a::SRow) = count_ones(a)
+Base.eltype(::SRow) = Int
+
+(Base.:&)(a::SRow{N}, b::SRow{N}) where N = SRow(ntuple(i->(@inbounds a.chunks[i] & b.chunks[i]), N))
+(Base.:|)(a::SRow{N}, b::SRow{N}) where N = SRow(ntuple(i->(@inbounds a.chunks[i] | b.chunks[i]), N))
+(Base.xor)(a::SRow{N}, b::SRow{N}) where N = SRow(ntuple(i->(@inbounds xor(a.chunks[i], b.chunks[i])), N))
+(Base.:~)(a::SRow{N}) where N = SRow(ntuple(i->(@inbounds ~a.chunks[i]), N))
+Base.zero(::Type{SRow{N}}) where N = SRow(ntuple(i->UInt64(0), N))
+
+Base.@propagate_inbounds function Base.setindex!(a::Base.RefValue{SRow{N}}, b, idx) where N
+    i1,i2 = Base.get_chunks_id(idx)
+    @boundscheck ((0<i1<=N) || throw(BoundsError(a, idx)))
+    @inbounds u = a[].chunks[i1]
+    nu = ifelse(b, u | (1<< (i2 & 63)), u & ~(1<< (i2 & 63)) )
+    ptr = convert(Ptr{UInt64}, pointer_from_objref(a))
+    GC.@preserve a unsafe_store!(ptr, nu, i1)
+    b
+end
+
+Base.@propagate_inbounds function mk_msk(::Type{SRow{N}}, idx) where N
+    i1,i2 = Base.get_chunks_id(idx)
+    @boundscheck ((0<i1<=N) || throw(BoundsError(SRow{N}, idx)))
+    r = Ref(zero(SRow{N}))
+    ptr = convert(Ptr{UInt64}, pointer_from_objref(a))
+    GC.@preserve r begin
+    for i=1:i1-1
+        unsafe_store!(ptr, -1%UInt, i)
+    end
+    unsafe_store!(ptr, Base._msk_end(idx), i1)
+    end
+    return r[]
+end
+
+
+Base.@propagate_inbounds Base.setindex(a::SRow{N}, b, idx) where N = begin r=Ref(a); setindex!(r, b, idx); r[] end
+
+@inline function Base.count_ones(a::SRow{N}) where N
+    res = 0
+    for i=1:N
+        @inbounds res+= count_ones(a[i])
+    end
+    res
+end
+Base.@propagate_inbounds function Base.count_ones(a::SRow{N}, k) where N
+    res = 0
+    i1, i2 = Base.get_chunks_id(k)
+    for i = 1:i1-1
+        res += count_ones(a[i])
+    end
+    res += count_ones(a[i1] & Base.msk_end(i1))
+    res
+end
+
+
+##SBMGraph
+struct SBMGraph{N} <:AbstractBMGraph
+    adj_chunks::Matrix{UInt64}
+end
+@inline SBMGraph(g::BMGraph) = SBMGraph(g, Val(nchunks(g)))
+SBMGraph(g::BMGraph, ::Val{N}) where N = SBMGraph{N}(g.adj_chunks)
+
+
+
+nchunks(g::SBMGraph{N}) where N = N
+Base.@propagate_inbounds function Base.getindex(g::SBMGraph{N}, idx) where N
+    @boundscheck checkbounds(g.adj_chunks, 1, idx)
+    off = N*(idx-1)
+    return SRow(ntuple(i -> (@inbounds g.adj_chunks[i + off]), N))
+end
+Base.@propagate_inbounds LightGraphs.outneighbors(g::SBMGraph, idx) = g[idx]
+function LightGraphs.ne(g::SBMGraph)
+    s = sum(count_ones, g.adj_chunks)
+    for i=1:nv(g)
+        i in g[i] && (s+=1)
+    end
+    return s>>1
+end
+Base.@propagate_inbounds LightGraphs.has_edge(g::SBMGraph, s, d) = d in g[s]
+Base.@propagate_inbounds LightGraphs.indegree(g::SBMGraph, v::Integer) = count_ones(g[v])
+Base.@propagate_inbounds LightGraphs.outdegree(g::SBMGraph, v::Integer) = count_ones(g[v])
+
+
+LightGraphs.gdistances(g::SBMGraph{N}, s) where N = gdistances!(g, s, fill(0, nv(g)))
+function LightGraphs.gdistances!(g::SBMGraph{N}, s, res) where N
+    resize!(res, nv(g))
+    fill!(res, 0)
+    T = SRow{N}
+    @inbounds todo = visited = g[s]
+    nxt = zero(T)
+    dist = 1
+    done = false
+    while !done
+        done = true
+        for i in todo
+            @inbounds nxt |= g[i] & ~visited
+            @inbounds res[i] = dist
+            done = false
+        end
+        done && break
+        visited |= nxt
+        todo = nxt
+        nxt = zero(T)
+        dist += 1
+    end
+    res[s] = 0
+    res
+end
 
 end

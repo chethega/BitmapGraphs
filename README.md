@@ -4,7 +4,7 @@ Experimental Bitmap-backed undirected graphs for [LightGraphs.jl](https://github
 
 Examples:
 ```
-using LightGraphs, BitmapGraphs, SparseArrays
+using LightGraphs, BitmapGraphs, SparseArrays, BenchmarkTools
 r=sprand(1000, 1000, 0.05); r=r+r';
 g = induced_subgraph(BMGraph, r, 1:3:1000);
 gs = SimpleGraph(nv(g)); for ed in edges(g) add_edge!(gs, src(ed), dst(ed)); end;
@@ -85,10 +85,63 @@ end
 gives
 ```
 julia> r=sprand(10_000, 10_000, 0.025); r=r+r'; g = induced_subgraph(BMGraph, r, 1:10_000); gs=SimpleGraph(nv(g)); for ed in edges(g) add_edge!(gs, src(ed), dst(ed)) end;
-julia> using BenchmarkTools
 julia> @btime gdistances(g, 17); @btime gdistances(gs, 17); gdistances(g, 17)==gdistances(gs, 17)
   1.145 ms (7 allocations: 82.28 KiB)
   9.139 ms (8 allocations: 236.09 KiB)
 true
 ```
 
+For tiny graphs, we provide `SBMGraph{N}`: A bitmapped graph that carries `size(g.adj_chunks, 1)` in its type. At the price of a likely type-instability (that needs to be caught by a function barrier), this provides a very convenient and fast graph type, since `neighbors(g, i)` (shorthand: `g[i]`)  can often be a single vector register. This is only useful for tiny graphs, where we can amortize the type-instability by running expensive analyses. As an example implementation:
+
+```
+function LightGraphs.gdistances!(g::SBMGraph{N}, s, res) where N
+    resize!(res, nv(g))
+    fill!(res, 0)
+    T = SRow{N}
+    @inbounds todo = visited = g[s]
+    nxt = zero(T)
+    dist = 1
+    done = false
+    while !done
+        done = true
+        @inbounds for i in todo
+            nxt |= g[i] & ~visited
+            res[i] = dist
+            done = false
+        end
+        done && break
+        visited |= nxt
+        todo = nxt
+        nxt = zero(T)
+        dist += 1
+    end
+    res[s] = 0
+    res
+end
+```
+yields a significant speed-up over LightGraphs (depending on density):
+```
+julia> n=350; r=sprand(n, n, 0.025); r=r+r'; g = induced_subgraph(BMGraph, r, 1:n); set_diag!(g, false); gsimple=SimpleGraph(nv(g)); for ed in edges(g) add_edge!(gsimple, src(ed), dst(ed)) end; gstatic = SBMGraph(g);
+
+julia> s=17; gdistances(g, s) == gdistances(gsimple, s) == gdistances(gstatic, s)
+true
+
+julia> @btime gdistances(gsimple, s); @btime gdistances(g, s); @btime gdistances(gstatic, s);
+  23.768 μs (7 allocations: 8.81 KiB)
+  4.476 μs (6 allocations: 3.34 KiB)
+  1.752 μs (1 allocation: 2.88 KiB)
+
+julia> n=350; r=sprand(n, n, 0.1); r=r+r'; g = induced_subgraph(BMGraph, r, 1:n); set_diag!(g, false); gsimple=SimpleGraph(nv(g)); for ed in edges(g) add_edge!(gsimple, src(ed), dst(ed)) end; gstatic = SBMGraph(g);
+
+julia> @btime gdistances(gsimple, s); @btime gdistances(g, s); @btime gdistances(gstatic, s);
+  49.087 μs (7 allocations: 8.81 KiB)
+  4.400 μs (6 allocations: 3.34 KiB)
+  1.786 μs (1 allocation: 2.88 KiB)
+
+julia> n=128; r=sprand(n, n, 0.1); r=r+r'; g = induced_subgraph(BMGraph, r, 1:n); set_diag!(g, false); gsimple=SimpleGraph(nv(g)); for ed in edges(g) add_edge!(gsimple, src(ed), dst(ed)) end; gstatic = SBMGraph(g);
+
+julia> @btime gdistances(gsimple, s); @btime gdistances(g, s); @btime gdistances(gstatic, s);
+  8.845 μs (7 allocations: 3.55 KiB)
+  1.153 μs (6 allocations: 1.52 KiB)
+  486.164 ns (1 allocation: 1.14 KiB)
+```
