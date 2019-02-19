@@ -14,10 +14,10 @@ struct LBitRow{chunk_T}
 end
 
 #future feature
-#struct BitRow{chunk_T}
-#    chunks::chunk_T
-#end
-const _BitRow = Union{LBitRow}# BitRow
+struct BitRow{chunk_T}
+    chunks::chunk_T
+end
+const _BitRow = Union{LBitRow, BitRow}# BitRow
 
 nchunks(br::_BitRow) = length(br.chunks)
 
@@ -36,7 +36,7 @@ function Base.iterate(br::_BitRow)
 end
 
 #@inline Base.length(br::BitRow) = sum(count_ones, br.chunks)
-@inline Base.length(br::LBitRow) = sum(count_ones, br.len)
+@inline Base.length(br::LBitRow) = br.len
 
 
 @inline function Base.iterate(br::_BitRow, s)
@@ -296,6 +296,36 @@ function LightGraphs.induced_subgraph(::Type{BMGraph}, mat::SparseMatrixCSC, ver
         bailout(bm, i) && return bm
     end
     return bm
+end
+
+#example algorithm
+function LightGraphs.gdistances(g::BMGraph, s)
+    res = fill(-1, nv(g))
+    nchunks = size(g.adj_chunks, 1)
+    visited = zeros(UInt, nchunks)
+    todo = zeros(UInt, nchunks)
+    nxt = zeros(UInt, nchunks)
+    done = false
+    dist = 1
+    todo .= outneighbors(g, s).chunks
+    visited .= outneighbors(g, s).chunks
+    while !done
+        done = true
+        for i in BitRow(todo)
+            @simd for j = 1:nchunks
+                @inbounds nxt[j] |= g.adj_chunks[j, i] & ~visited[j]
+            end
+            res[i] = dist
+            done = false
+        end
+        done && break
+        visited .|= nxt
+        todo .= nxt
+        fill!(nxt, 0)
+        dist += 1
+    end
+    res[s] = 0
+    res
 end
 
 

@@ -50,3 +50,45 @@ Note that `BMGraph` has a dense storage format: It takes `nv(g)^2` bits. This is
 
 The `BMGraph` is originally intended for `induced_subgraph`: Use a two-tiered algorithm that combines a large sparse graph with many small dense induced subgraphs.
 
+
+Bitmaped graphs require a very different style of coding. As an example:
+```
+function LightGraphs.gdistances(g::BMGraph, s)
+    res = fill(-1, nv(g))
+    nchunks = size(g.adj_chunks, 1)
+    visited = zeros(UInt, nchunks)
+    todo = zeros(UInt, nchunks)
+    nxt = zeros(UInt, nchunks)
+    done = false
+    dist = 1
+    todo .= outneighbors(g, s).chunks
+    visited .= outneighbors(g, s).chunks
+    while !done
+        done = true
+        for i in BitRow(todo)
+            @simd for j = 1:nchunks
+                @inbounds nxt[j] |= g.adj_chunks[j, i] & ~visited[j]
+            end
+            res[i] = dist
+            done = false
+        end
+        done && break
+        visited .|= nxt
+        todo .= nxt
+        fill!(nxt, 0)
+        dist += 1
+    end
+    res[s] = 0
+    res
+end
+```
+gives
+```
+julia> r=sprand(10_000, 10_000, 0.025); r=r+r'; g = induced_subgraph(BMGraph, r, 1:10_000); gs=SimpleGraph(nv(g)); for ed in edges(g) add_edge!(gs, src(ed), dst(ed)) end;
+julia> using BenchmarkTools
+julia> @btime gdistances(g, 17); @btime gdistances(gs, 17); gdistances(g, 17)==gdistances(gs, 17)
+  1.145 ms (7 allocations: 82.28 KiB)
+  9.139 ms (8 allocations: 236.09 KiB)
+true
+```
+
