@@ -3,7 +3,7 @@ module BitmapGraphs
 using LightGraphs, SparseArrays
 
 export AbstractBMGraph, BMGraph, invert!, set_diag!, BitRow, SRow, nchunks, mk_msk, SBMGraph
-
+import Base: setindex
 #utils for iterating over bit-chunks
 @inline _blsr(x) = x & (x-1)
 
@@ -21,6 +21,12 @@ struct SRow{N}
     chunks::NTuple{N, UInt64}
 end
 const _BitRow = Union{LBitRow, BitRow, SRow}# BitRow
+
+#opt out of simd. Fixme once github.com/JuliaLang/julia/pull/31113 has landed.
+Base.SimdLoop.simd_index(v::_BitRow, j::Int64, i) = j
+Base.SimdLoop.simd_inner_length(v::_BitRow, j::Int64) = 1
+Base.SimdLoop.simd_outer_range(v::_BitRow) = v
+
 
 nchunks(br::_BitRow) = length(br.chunks)
 
@@ -246,14 +252,13 @@ function LightGraphs.induced_subgraph(::Type{BMGraph}, g::LightGraphs.AbstractGr
     for (i,v) in enumerate(vertices)
         vi = 1
         #vv = vertices[1]
-        for u in neighbors(g, v)
-            u < v && continue
-            while @inbounds vertices[vi] < u
+        @inbounds for u in neighbors(g, v)
+            u <  vertices[vi] && continue
+            while vertices[vi] < u
                 vi < n || @goto done
                 vi += 1
             end
-            u < v && continue
-            @assert (u == @inbounds vertices[i])
+            u < vertices[vi] && continue
             add_edge!(bm, i, vi)
             vi += 1
         end
@@ -290,11 +295,14 @@ function LightGraphs.induced_subgraph(::Type{BMGraph}, mat::SparseMatrixCSC, ver
                 vi += 1
             end
             @inbounds u <  vertices[vi] && continue
-            edgepred(v, u, @inbounds mat.nzval[ui]) && add_edge!(bm, i, vi)
+            edgepred(v, u, @inbounds mat.nzval[ui]) && (@inbounds bm.adj_mat[vi, i] = true)
             vi += 1
             vi < n || @goto done
         end
         @label done
+        deg = sum(count_ones, view(bm.adj_chunks, :, i))
+        bm.degrees[i] = deg
+        bm.ne += deg
         bailout(bm, i) && return bm
     end
     return bm
@@ -330,15 +338,8 @@ function LightGraphs.gdistances(g::BMGraph, s)
     res
 end
 
-
-    #TODO: SBMGraph, where nchunks is a type parameter.
-#This permits us to return an isbits row, backed by tuple or StaticVector.
-#idea is to be super fast and allocation-free for tiny graphs with <=512 vertices.
-
-#static BMGraph. Utils
-#struct SRow{N}
-#    chunks::NTuple{N, UInt64}
-#end
+###############
+#Static graphs
 
 #Base.in, Base.iterate, are defined above
 @inline Base.length(a::SRow) = count_ones(a)
@@ -349,6 +350,9 @@ Base.eltype(::SRow) = Int
 (Base.xor)(a::SRow{N}, b::SRow{N}) where N = SRow(ntuple(i->(@inbounds xor(a.chunks[i], b.chunks[i])), N))
 (Base.:~)(a::SRow{N}) where N = SRow(ntuple(i->(@inbounds ~a.chunks[i]), N))
 Base.zero(::Type{SRow{N}}) where N = SRow(ntuple(i->UInt64(0), N))
+Base.iszero(a::SRow{N}) where N = all(iszero, a.chunks)
+Base.isempty(a::SRow{N}) where N = all(iszero, a.chunks)
+
 
 Base.@propagate_inbounds function Base.setindex!(a::Base.RefValue{SRow{N}}, b, idx) where N
     i1,i2 = Base.get_chunks_id(idx)
@@ -364,7 +368,7 @@ Base.@propagate_inbounds function mk_msk(::Type{SRow{N}}, idx) where N
     i1,i2 = Base.get_chunks_id(idx)
     @boundscheck ((0<i1<=N) || throw(BoundsError(SRow{N}, idx)))
     r = Ref(zero(SRow{N}))
-    ptr = convert(Ptr{UInt64}, pointer_from_objref(a))
+    ptr = convert(Ptr{UInt64}, pointer_from_objref(r))
     GC.@preserve r begin
     for i=1:i1-1
         unsafe_store!(ptr, -1%UInt, i)
@@ -374,13 +378,27 @@ Base.@propagate_inbounds function mk_msk(::Type{SRow{N}}, idx) where N
     return r[]
 end
 
+#=
+function pop_(a::SRow{N}) where N
+    i = 1
+    @inbounds while i <= N && iszero(a.chunks[i])
+        i += 1
+    end
+    i == N+1 && return -1, a
+    @inbounds idx = trailing_zeros(a.chunks[i]) + 1 + (i-1)<<6
+    r = Ref(a)
+    ptr = convert(Ptr{UInt64}, pointer_from_objref(a))
+    unsafe_store!(ptr, _blsr(a.chunks[i]), i)
+    return idx, a[]
+end
+=#
 
 Base.@propagate_inbounds Base.setindex(a::SRow{N}, b, idx) where N = begin r=Ref(a); setindex!(r, b, idx); r[] end
 
 @inline function Base.count_ones(a::SRow{N}) where N
     res = 0
     for i=1:N
-        @inbounds res+= count_ones(a[i])
+        @inbounds res+= count_ones(a.chunks[i])
     end
     res
 end
@@ -388,9 +406,9 @@ Base.@propagate_inbounds function Base.count_ones(a::SRow{N}, k) where N
     res = 0
     i1, i2 = Base.get_chunks_id(k)
     for i = 1:i1-1
-        res += count_ones(a[i])
+        res += count_ones(a.chunks[i])
     end
-    res += count_ones(a[i1] & Base.msk_end(i1))
+    res += count_ones(a.chunks[i1] & Base.msk_end(i1))
     res
 end
 
@@ -447,6 +465,4 @@ function LightGraphs.gdistances!(g::SBMGraph{N}, s, res) where N
     end
     res[s] = 0
     res
-end
-
 end
