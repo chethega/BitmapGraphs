@@ -466,3 +466,5 @@ function LightGraphs.gdistances!(g::SBMGraph{N}, s, res) where N
     res[s] = 0
     res
 end
+
+end
